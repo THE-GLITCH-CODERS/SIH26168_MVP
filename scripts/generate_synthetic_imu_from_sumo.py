@@ -162,66 +162,71 @@ def trajectory_to_phone_features(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--fcd", type=Path, required=True, help="SUMO --fcd-output XML")
+    parser.add_argument("--fcd", type=Path, action="append", required=True,
+                        help="SUMO --fcd-output XML; repeat to combine independent scenarios")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--seed", type=int, default=20260928)
     parser.add_argument("--target-hz", type=float, default=10.0)
     parser.add_argument("--vibration-probability-per-s", type=float, default=0.12)
     args = parser.parse_args()
-    if not args.fcd.exists():
-        raise SystemExit(f"FCD file not found: {args.fcd}")
+    missing = [path for path in args.fcd if not path.is_file()]
+    if missing:
+        raise SystemExit("FCD file not found: " + ", ".join(str(path) for path in missing))
     if not math.isfinite(args.target_hz) or args.target_hz <= 0:
         raise SystemExit("--target-hz must be positive and finite")
     if args.vibration_probability_per_s < 0:
         raise SystemExit("--vibration-probability-per-s cannot be negative")
 
     rng = np.random.default_rng(args.seed)
-    trajectories = read_fcd(args.fcd)
     feature_rows: list[np.ndarray] = []
     speed_rows: list[np.ndarray] = []
     time_rows: list[np.ndarray] = []
     drive_rows: list[np.ndarray] = []
     metadata: list[dict] = []
-    for vehicle_index, (vehicle_id, rows) in enumerate(sorted(trajectories.items())):
-        ordered = sorted(rows, key=lambda row: row[0])
-        source_times = np.asarray([row[0] for row in ordered], dtype=np.float64)
-        positive_dt = np.diff(source_times)
-        positive_dt = positive_dt[positive_dt > 1e-6]
-        if not len(positive_dt):
-            print(f"SKIP {vehicle_id}: no positive timestamps")
-            continue
-        # Do not interpolate through SUMO vehicle disappearance/re-entry gaps.
-        max_gap = max(0.25, 3.0 * float(np.median(positive_dt)))
-        boundaries = np.concatenate(([0], np.flatnonzero(np.diff(source_times) > max_gap) + 1, [len(ordered)]))
-        episode_index = 0
-        for begin, end in zip(boundaries[:-1], boundaries[1:]):
-            episode = ordered[int(begin):int(end)]
-            if len(episode) < 4:
+    for fcd_index, fcd_path in enumerate(args.fcd):
+        trajectories = read_fcd(fcd_path)
+        for vehicle_id, rows in sorted(trajectories.items()):
+            ordered = sorted(rows, key=lambda row: row[0])
+            source_times = np.asarray([row[0] for row in ordered], dtype=np.float64)
+            positive_dt = np.diff(source_times)
+            positive_dt = positive_dt[positive_dt > 1e-6]
+            if not len(positive_dt):
+                print(f"SKIP {fcd_path.name}/{vehicle_id}: no positive timestamps")
                 continue
-            try:
-                features, speed, times, source_rate = trajectory_to_phone_features(
-                    episode, rng, target_hz=args.target_hz,
-                    vibration_probability_per_s=args.vibration_probability_per_s,
-                )
-                synthetic_drive = len(metadata)
-                feature_rows.append(features)
-                speed_rows.append(speed)
-                time_rows.append(times - times[0])
-                drive_rows.append(np.full(len(times), synthetic_drive, dtype=np.uint32))
-                metadata.append({
-                    "synthetic_drive_index": synthetic_drive,
-                    "vehicle_id": vehicle_id,
-                    "episode_index": episode_index,
-                    "source_fcd_rows": len(episode),
-                    "rows_generated": len(times),
-                    "duration_s": float(times[-1] - times[0]),
-                    "fcd_median_rate_hz": source_rate,
-                    "synthetic_imu_rate_hz": args.target_hz,
-                    "split": "train_only",
-                })
-                episode_index += 1
-            except ValueError as exc:
-                print(f"SKIP {vehicle_id} episode {episode_index}: {exc}")
+            # Do not interpolate through SUMO vehicle disappearance/re-entry gaps.
+            max_gap = max(0.25, 3.0 * float(np.median(positive_dt)))
+            boundaries = np.concatenate(([0], np.flatnonzero(np.diff(source_times) > max_gap) + 1, [len(ordered)]))
+            episode_index = 0
+            for begin, end in zip(boundaries[:-1], boundaries[1:]):
+                episode = ordered[int(begin):int(end)]
+                if len(episode) < 4:
+                    continue
+                try:
+                    features, speed, times, source_rate = trajectory_to_phone_features(
+                        episode, rng, target_hz=args.target_hz,
+                        vibration_probability_per_s=args.vibration_probability_per_s,
+                    )
+                    synthetic_drive = len(metadata)
+                    feature_rows.append(features)
+                    speed_rows.append(speed)
+                    time_rows.append(times - times[0])
+                    drive_rows.append(np.full(len(times), synthetic_drive, dtype=np.uint32))
+                    metadata.append({
+                        "synthetic_drive_index": synthetic_drive,
+                        "source_fcd_index": fcd_index,
+                        "source_fcd": str(fcd_path.resolve()),
+                        "vehicle_id": vehicle_id,
+                        "episode_index": episode_index,
+                        "source_fcd_rows": len(episode),
+                        "rows_generated": len(times),
+                        "duration_s": float(times[-1] - times[0]),
+                        "fcd_median_rate_hz": source_rate,
+                        "synthetic_imu_rate_hz": args.target_hz,
+                        "split": "train_only",
+                    })
+                    episode_index += 1
+                except ValueError as exc:
+                    print(f"SKIP {fcd_path.name}/{vehicle_id} episode {episode_index}: {exc}")
 
     if not feature_rows:
         raise SystemExit("No usable vehicle trajectories found in SUMO FCD XML")
@@ -238,7 +243,7 @@ def main() -> None:
     metadata_path.write_text(json.dumps({
         "schema_version": 1,
         "source": "SUMO FCD trajectories with synthetic smartphone IMU sensor effects",
-        "source_fcd": str(args.fcd.resolve()),
+        "source_fcds": [str(path.resolve()) for path in args.fcd],
         "seed": args.seed,
         "target_hz": args.target_hz,
         "features": [

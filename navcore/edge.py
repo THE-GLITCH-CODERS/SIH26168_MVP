@@ -80,6 +80,9 @@ class EdgeDiagnostics:
     interval_median_ms: float | None
     interval_rms_jitter_ms: float | None
     intervals_over_gap_limit: int
+    output_samples: int = 0
+    measured_output_hz: float | None = None
+    processing_latency_p95_ms: float | None = None
 
 
 @dataclass(frozen=True)
@@ -193,7 +196,10 @@ class EdgeNavigationEngine:
         self.map_matcher = map_matcher
         self._nominal_period_ns = 1e9 / adapter.config.target_imu_hz
         self._timestamps = deque(maxlen=256)
+        self._output_timestamps = deque(maxlen=256)
+        self._latencies_ms = deque(maxlen=512)
         self._samples_seen = 0
+        self._outputs_seen = 0
         self._gap_count = 0
 
     def diagnostics(self) -> EdgeDiagnostics:
@@ -202,7 +208,8 @@ class EdgeNavigationEngine:
             for left, right in zip(self._timestamps, list(self._timestamps)[1:])
         ]
         if not intervals_ms:
-            return EdgeDiagnostics(self._samples_seen, None, None, None, self._gap_count)
+            return EdgeDiagnostics(self._samples_seen, None, None, None, self._gap_count,
+                                   self._outputs_seen, None, self._latency_p95())
         ordered = sorted(intervals_ms)
         mid = len(ordered) // 2
         median = ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2.0
@@ -210,7 +217,17 @@ class EdgeNavigationEngine:
         jitter = math.sqrt(sum((interval - mean) ** 2 for interval in intervals_ms) / len(intervals_ms))
         duration_ns = self._timestamps[-1] - self._timestamps[0]
         measured_hz = (len(self._timestamps) - 1) * 1e9 / duration_ns if duration_ns > 0 else None
-        return EdgeDiagnostics(self._samples_seen, measured_hz, median, jitter, self._gap_count)
+        output_hz = None
+        if len(self._output_timestamps) > 1 and self._output_timestamps[-1] > self._output_timestamps[0]:
+            output_hz = (len(self._output_timestamps) - 1) * 1e9 / (self._output_timestamps[-1] - self._output_timestamps[0])
+        return EdgeDiagnostics(self._samples_seen, measured_hz, median, jitter, self._gap_count,
+                               self._outputs_seen, output_hz, self._latency_p95())
+
+    def _latency_p95(self) -> float | None:
+        if not self._latencies_ms:
+            return None
+        ordered = sorted(self._latencies_ms)
+        return ordered[min(len(ordered) - 1, math.ceil(0.95 * len(ordered)) - 1)]
 
     def process_imu(
         self,
@@ -240,6 +257,9 @@ class EdgeNavigationEngine:
         if state is None:
             return None
         latency_ms = (time.perf_counter_ns() - started_ns) / 1e6
+        self._output_timestamps.append(state.timestamp_ns)
+        self._latencies_ms.append(latency_ms)
+        self._outputs_seen += 1
         return EdgeNavigationResult(state, self.diagnostics(), latency_ms)
 
     def update_gnss(

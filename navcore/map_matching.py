@@ -61,6 +61,11 @@ class _RoadArc:
     end_n_m: float
     length_m: float
     bearing_deg: float
+    highway: str = ""
+    name: str = ""
+    tunnel: str = ""
+    bridge: str = ""
+    layer: int = 0
 
 
 @dataclass(frozen=True)
@@ -167,7 +172,9 @@ class OfflineRoadNetwork:
                         continue
                     bearing = (math.degrees(math.atan2(de, dn)) + 360.0) % 360.0
                     arcs.append(_RoadArc(
-                        len(arcs), way_id, a[0], b[0], a[1][0], a[1][1], b[1][0], b[1][1], length, bearing
+                        len(arcs), way_id, a[0], b[0], a[1][0], a[1][1], b[1][0], b[1][1], length, bearing,
+                        tags.get("highway", ""), tags.get("name", ""), tags.get("tunnel", ""),
+                        tags.get("bridge", ""), int(tags.get("layer", "0") or 0),
                     ))
         if not arcs:
             raise ValueError("No routable OSM segments could be built from this extract")
@@ -394,6 +401,10 @@ class ConfidenceGatedMapMatcher:
         probabilities = self._softmax([state.log_score for state in self._beam])
         best = self._beam[0]
         confidence = probabilities[0]
+        if observation.horizontal_sigma_m > 50.0 or best.candidate.distance_m > max(10.0, 3.0*observation.horizontal_sigma_m):
+            self._beam.clear()
+            return MapMatchResult(observation.timestamp_ns, observation.latitude_deg, observation.longitude_deg,
+                None, None, None, best.candidate.distance_m, 0.0, False, "absolute_road_distance_or_uncertainty_gate")
         accepted = confidence >= self.confidence_threshold
         if not accepted:
             return MapMatchResult(

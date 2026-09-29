@@ -141,7 +141,9 @@ class VehicleSignalProcessor {
         val stationaryEvidence = if (gnssFresh && speed != null) {
             speed < 0.8 && gyroNorm < 0.10 && linearNorm < 0.55
         } else {
-            gyroNorm < 0.045 && linearNorm < 0.22
+            // Constant-speed travel can have the same quiet IMU signal as rest.
+            // Never zero velocity merely because a moving car enters a smooth tunnel.
+            !lastKnownMoving && gyroNorm < 0.045 && linearNorm < 0.22
         }
         stationarySeconds = if (stationaryEvidence && dt in 0.001..0.2) stationarySeconds + dt else if (stationaryEvidence) stationarySeconds else 0.0
         if (stationarySeconds >= 2.0 && gyroNorm < 0.10 && linearNorm < 0.55) {
@@ -176,7 +178,8 @@ class VehicleSignalProcessor {
             dt > 0.1 -> 0.45
             else -> 0.75
         }
-        if (alignmentOffsetRad != null) quality = min(1.0, quality + 0.15 * alignmentConfidence())
+        if (mountShiftSuspected) quality = min(quality, 0.20)
+        else if (alignmentOffsetRad != null) quality = min(1.0, quality + 0.15 * alignmentConfidence())
         val normalDriving = moving && !impact && !highVibration && !mountShiftSuspected
         val calibrated = biasSamples > 0L && alignmentOffsetRad != null && alignmentConfidence() >= 0.45 && !mountShiftSuspected
         val detail = when {

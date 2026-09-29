@@ -14,5 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "SeamlessNav"
+rootProject.name = "NAVIS"
 include(":app")

@@ -38,9 +38,9 @@ def locate_binary(explicit: str | None, name: str, sumo_home: Path | None) -> st
     raise SystemExit(f"Could not find {name}; install Eclipse SUMO or pass --{name}-bin")
 
 
-def run(command: list[str]) -> None:
+def run(command: list[str], *, cwd: Path | None = None) -> None:
     print("RUN:", subprocess.list2cmdline(command))
-    subprocess.run(command, check=True)
+    subprocess.run(command, check=True, cwd=cwd)
 
 
 def main() -> None:
@@ -67,8 +67,20 @@ def main() -> None:
     sumo = locate_binary(args.sumo_bin, "sumo", sumo_home)
     netgenerate = locate_binary(args.netgenerate_bin, "netgenerate", sumo_home)
     random_trips = args.random_trips
-    if random_trips is None and sumo_home:
-        random_trips = sumo_home / "tools" / "randomTrips.py"
+    if random_trips is None:
+        candidate_homes = []
+        if sumo_home:
+            candidate_homes.append(sumo_home)
+        # SUMO may be on PATH while SUMO_HOME is unset. Infer the distribution
+        # root from the resolved bin/sumo executable before giving up.
+        sumo_root_from_path = Path(sumo).resolve().parent.parent
+        if sumo_root_from_path not in candidate_homes:
+            candidate_homes.append(sumo_root_from_path)
+        for candidate_home in candidate_homes:
+            candidate = candidate_home / "tools" / "randomTrips.py"
+            if candidate.is_file():
+                random_trips = candidate
+                break
     if random_trips is None or not random_trips.exists():
         raise SystemExit("Could not find SUMO tools/randomTrips.py; pass --random-trips or set SUMO_HOME")
 
@@ -78,7 +90,7 @@ def main() -> None:
     run([
         netgenerate, "--grid", f"--grid.number={args.grid_number}",
         f"--grid.length={args.grid_length_m}", f"--output-file={network}",
-    ])
+    ], cwd=output)
     scenarios = []
     # Vary traffic demand and random seed to produce distinct stop/go profiles.
     demand_scales = (0.55, 0.8, 1.0, 1.35, 1.8)
@@ -92,12 +104,12 @@ def main() -> None:
             sys.executable, str(random_trips), "-n", str(network), "-r", str(routes),
             "--begin", "0", "--end", str(args.duration_s), "--period", f"{period:.6f}",
             "--seed", str(seed),
-        ])
+        ], cwd=output)
         run([
             sumo, "--net-file", str(network), "--route-files", str(routes),
             "--end", str(args.duration_s), "--step-length", str(args.step_length_s),
             "--fcd-output", str(fcd), "--seed", str(seed), "--no-step-log", "true",
-        ])
+        ], cwd=output)
         scenarios.append({
             "scenario_index": index,
             "seed": seed,

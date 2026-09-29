@@ -2,10 +2,15 @@
     <uses-feature android:name="android.hardware.location.gps" android:required="false" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
 
     <application
         android:allowBackup="false"
-        android:label="SeamlessNav Logger"
+        android:icon="@drawable/navis_logo"
+        android:roundIcon="@drawable/navis_logo"
+        android:label="NAVIS"
         android:theme="@android:style/Theme.Material.Light.NoActionBar"
         android:usesCleartextTraffic="false">
         <activity
@@ -16,5 +21,9 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <service
+            android:name=".NavigationSessionService"
+            android:exported="false"
+            android:foregroundServiceType="location" />
     </application>
 </manifest>

@@ -36,6 +36,15 @@ class VehicleFusionFilter:
     """
 
     _N = 7
+    _MAX_GNSS_ACCURACY_M = 35.0
+    _GOOD_GNSS_ACCURACY_M = 15.0
+    _ENTER_DEGRADED_ACCURACY_M = 20.0
+    _EXIT_DEGRADED_ACCURACY_M = 12.0
+    _GNSS_DEGRADED_AFTER_NS = 1_500_000_000
+    _GNSS_OUTAGE_TIMEOUT_NS = 3_000_000_000
+    _REQUIRED_REACQUISITION_FIXES = 3
+    _NORMAL_POSITION_GATE = 9.21
+    _REACQUISITION_POSITION_GATE = 50.0
 
     def __init__(
         self,
@@ -77,8 +86,12 @@ class VehicleFusionFilter:
         self.last_timestamp_ns: int | None = None
         self.next_output_ns: int | None = None
         self.last_gnss_ns: int | None = None
+        self.last_gnss_accuracy_m: float | None = None
         self.last_gnss_accepted = False
         self.last_gnss_reason = "no_fix"
+        self.reacquiring_gnss = False
+        self.reacquisition_fix_count = 0
+        self.gnss_quality_degraded = False
 
     @staticmethod
     def _wrap(angle: float) -> float:
@@ -163,21 +176,75 @@ class VehicleFusionFilter:
     ) -> bool:
         """Apply a quality-weighted GNSS position and optional velocity fix."""
         vals = (east_m, north_m, horizontal_sigma_m)
-        if not all(math.isfinite(v) for v in vals) or horizontal_sigma_m <= 0:
+        if timestamp_ns < 0 or not all(math.isfinite(v) for v in vals) or horizontal_sigma_m <= 0:
             raise ValueError("GNSS position and positive accuracy must be finite")
         if self.last_gnss_ns is not None and timestamp_ns < self.last_gnss_ns:
             raise ValueError("GNSS fixes must be delivered in timestamp order")
         if self.last_timestamp_ns is not None and timestamp_ns > self.last_timestamp_ns:
             raise ValueError("propagate IMU through the GNSS timestamp before applying that fix")
-        sigma = min(max(horizontal_sigma_m, 1.0), 100.0)
+        if horizontal_sigma_m > self._MAX_GNSS_ACCURACY_M:
+            self.last_gnss_accepted = False
+            self.last_gnss_reason = "accuracy_gate"
+            self.gnss_quality_degraded = True
+            if self.reacquiring_gnss:
+                self.reacquisition_fix_count = 0
+            return False
+
+        if self.last_gnss_ns is None:
+            # Cold start: use the first valid fix to establish local position
+            # and (when available) vehicle course. Startup is not reacquisition
+            # after a dropout and must not retain the default east-facing yaw.
+            self.x[0:2] = (east_m, north_m)
+            self.P[0, 0] = self.P[1, 1] = max(horizontal_sigma_m, 1.0) ** 2
+            if speed_mps is not None and math.isfinite(speed_mps) and speed_mps >= 0:
+                if course_deg_north_clockwise is not None and speed_mps >= 1.0:
+                    heading = self.course_deg_to_heading_rad(course_deg_north_clockwise)
+                    self.x[4] = heading
+                    self.x[2] = speed_mps * math.cos(heading)
+                    self.x[3] = speed_mps * math.sin(heading)
+                    self.P[4, 4] = math.radians(max(course_sigma_deg, 2.0)) ** 2
+                else:
+                    self.x[2] = speed_mps * math.cos(self.x[4])
+                    self.x[3] = speed_mps * math.sin(self.x[4])
+                self.P[2, 2] = self.P[3, 3] = max(speed_sigma_mps, 0.2) ** 2
+            self.last_gnss_ns = timestamp_ns
+            self.last_gnss_accuracy_m = max(horizontal_sigma_m, 1.0)
+            self.last_gnss_accepted = True
+            self.last_gnss_reason = "initial_fix"
+            self.gnss_quality_degraded = horizontal_sigma_m > self._EXIT_DEGRADED_ACCURACY_M
+            self.reacquiring_gnss = False
+            self.reacquisition_fix_count = self._REQUIRED_REACQUISITION_FIXES
+            return True
+
+        outage_detected = self.last_gnss_ns is None or timestamp_ns - self.last_gnss_ns > self._GNSS_OUTAGE_TIMEOUT_NS
+        if outage_detected:
+            self.reacquiring_gnss = True
+            self.reacquisition_fix_count = 0
+
+        sigma = min(max(horizontal_sigma_m, 1.0), self._MAX_GNSS_ACCURACY_M)
+        measurement_scale = 1.0
+        if self.reacquiring_gnss:
+            measurement_scale = (9.0, 4.0, 1.0)[min(self.reacquisition_fix_count, 2)]
         H = np.zeros((2, self._N))
         H[0, 0] = H[1, 1] = 1.0
         residual = np.array([east_m - self.x[0], north_m - self.x[1]])
-        accepted, distance = self._update(residual, H, np.eye(2) * sigma**2, 9.21)
+        gate = self._REACQUISITION_POSITION_GATE if self.reacquiring_gnss else self._NORMAL_POSITION_GATE
+        accepted, distance = self._update(residual, H, np.eye(2) * sigma**2 * measurement_scale, gate)
         self.last_gnss_accepted = accepted
         self.last_gnss_reason = "accepted" if accepted else f"innovation_gate:{distance:.2f}"
         if accepted:
             self.last_gnss_ns = timestamp_ns
+            self.last_gnss_accuracy_m = sigma
+            if sigma >= self._ENTER_DEGRADED_ACCURACY_M:
+                self.gnss_quality_degraded = True
+            elif sigma <= self._EXIT_DEGRADED_ACCURACY_M:
+                self.gnss_quality_degraded = False
+            if self.reacquiring_gnss:
+                self.reacquisition_fix_count += 1
+                if self.reacquisition_fix_count >= self._REQUIRED_REACQUISITION_FIXES:
+                    self.reacquiring_gnss = False
+        elif self.reacquiring_gnss:
+            self.reacquisition_fix_count = 0
 
         if accepted and speed_mps is not None and math.isfinite(speed_mps) and speed_mps >= 0:
             speed_sigma = min(max(speed_sigma_mps, 0.2), 10.0)
@@ -192,14 +259,30 @@ class VehicleFusionFilter:
                 cross = np.array([math.cos(course), -math.sin(course)])
                 basis = np.column_stack((along, cross))
                 Rv = basis @ np.diag([speed_sigma**2, lateral_sigma**2]) @ basis.T
-                self._update(observed_velocity - self.x[2:4], Hv, Rv, 13.82)
+                self._update(observed_velocity - self.x[2:4], Hv, Rv * measurement_scale, 13.82)
+                # Course-over-ground is also the only available heading
+                # reference for an aligned vehicle-frame IMU. Without this
+                # update, the NHC can keep an uninitialized yaw pointed in its
+                # default direction and reject otherwise valid GNSS positions.
+                observed_heading = self.course_deg_to_heading_rad(course_deg_north_clockwise)
+                heading_residual = self._wrap(observed_heading - float(self.x[4]))
+                Hh = np.zeros((1, self._N))
+                Hh[0, 4] = 1.0
+                course_sigma = math.radians(max(course_sigma_deg, 2.0))
+                self._update(
+                    np.array([heading_residual]), Hh,
+                    np.array([[course_sigma**2 * measurement_scale]]), 13.82,
+                )
             else:
                 heading = self.x[4]
                 Hs = np.zeros((1, self._N))
                 Hs[0, 2], Hs[0, 3] = math.cos(heading), math.sin(heading)
                 Hs[0, 4] = -math.sin(heading) * self.x[2] + math.cos(heading) * self.x[3]
                 predicted_speed = self.x[2] * math.cos(heading) + self.x[3] * math.sin(heading)
-                self._update(np.array([speed_mps - predicted_speed]), Hs, np.array([[speed_sigma**2]]), 9.0)
+                self._update(
+                    np.array([speed_mps - predicted_speed]), Hs,
+                    np.array([[speed_sigma**2 * measurement_scale]]), 9.0,
+                )
         return accepted
 
     def update_virtual_speed(self, speed_mps: float, variance_m2ps2: float) -> bool:
@@ -300,8 +383,17 @@ class VehicleFusionFilter:
         timestamp = self.last_timestamp_ns if timestamp_ns is None else timestamp_ns
         if timestamp is None:
             raise RuntimeError("No timestamp available; process an IMU sample first")
-        gnss_age = math.inf if self.last_gnss_ns is None else max(0, timestamp - self.last_gnss_ns) / 1e9
-        mode = "GNSS_AIDED" if gnss_age <= 1.5 else "DEAD_RECKONING"
+        gnss_age_ns = math.inf if self.last_gnss_ns is None else max(0, timestamp - self.last_gnss_ns)
+        if self.last_gnss_ns is None:
+            mode = "WAITING_FOR_GNSS"
+        elif gnss_age_ns > self._GNSS_OUTAGE_TIMEOUT_NS:
+            mode = "DEAD_RECKONING"
+        elif self.reacquiring_gnss:
+            mode = "GNSS_REACQUIRING"
+        elif gnss_age_ns > self._GNSS_DEGRADED_AFTER_NS or self.gnss_quality_degraded:
+            mode = "GNSS_DEGRADED"
+        else:
+            mode = "GNSS_AIDED"
         ve, vn = float(self.x[2]), float(self.x[3])
         return NavigationOutput(
             timestamp_ns=int(timestamp),

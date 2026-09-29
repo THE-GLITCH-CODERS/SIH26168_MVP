@@ -1,0 +1,17 @@
+{
+  "source": "IO-VNBD held-out replay",
+  "outage_duration_s": 59.9,
+  "reference_distance_m": 449.5963074998792,
+  "metrics_by_method": {
+    "imu_nhc": {
+      "horizontal_endpoint_error_m": 311.3721553587528,
+      "horizontal_max_error_m": 311.3721553587528,
+      "horizontal_rmse_m": 180.78212520555286,
+      "reference_distance_m": 449.5963074998792,
+      "outage_duration_s": 59.9,
+      "endpoint_drift_percent_of_distance": 69.25594142225835,
+      "max_error_percent_of_distance": 69.25594142225835,
+      "under_10_percent_endpoint_drift": false
+    }
+  }
+}

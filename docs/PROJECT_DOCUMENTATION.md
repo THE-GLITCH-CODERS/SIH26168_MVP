@@ -35,9 +35,9 @@ The system reports its operating mode and uncertainty along with position. It al
 | Confidence-aware virtual speed sensor | Predict short-term speed change and uncertainty from IMU windows, then let the filter reduce its influence when the signal is poor. | Research direction; current ridge speed baseline is too weak for fusion. |
 | Motion-conditioned vehicle constraints | Use stop and sideways-motion constraints only during suitable driving, avoiding false corrections during shocks or possible slip. | Initial heuristic gates feed the phone filter; road validation is pending. |
 | Self-checking mount alignment | Adapt to different phone orientations and detect when a mount changes. | Initial tilt, gyro-bias, and GNSS-course estimates exist; full 3D alignment is pending. |
-| Integrity-aware GNSS transitions | Reject implausible fixes and avoid abrupt state changes after an outage. | Basic GNSS update/mode logic exists; stronger hysteresis and reacquisition testing are pending. |
-| Evidence-preserving map matching | Improve route presentation without claiming that map snapping fixed raw inertial drift. | Python HMM plus Android import and separate display-only road hypothesis; local map and route tests are pending. |
-| Shared design across two rates | Reuse a sensor-neutral state/output contract while phone and edge paths propagate at their measured input cadences. | Phone and Python edge prototypes exist; 10 Hz live output and 200 Hz external operation have not been verified. |
+| Integrity-aware GNSS transitions | Reject stale/poor/outlier fixes and avoid abrupt state changes after an outage. | Phone and Python filters use fix age, accuracy, innovation gating, quality hysteresis and three-fix variance-ramped reacquisition; device/route validation remains pending. |
+| Evidence-preserving map matching | Improve route presentation without claiming that map snapping fixed raw inertial drift. | Android and Python now use confidence-gated, directed road-continuity HMMs; Android renders imported road graph and raw/map tracks separately and styles bridge/tunnel metadata. A local road extract and route tests remain pending. |
+| Shared design across two rates | Reuse a sensor-neutral state/output contract while phone and edge paths propagate at their measured input cadences. | Phone records and reports measured 10 Hz state cadence; edge diagnostics report measured input/output cadence and latency. A genuine 200 Hz source/device result is still pending. |
 
 These are project design choices and hypotheses, not demonstrated benchmark improvements.
 
@@ -48,19 +48,26 @@ flowchart TD
     A[Phone IMU + GNSS<br/>or external IMU + GNSS] --> B[Timestamp, unit, and axis normalization]
     B --> C[Sensor health and vehicle alignment]
     C --> D[Motion quality: stop, turn, vibration, impact]
-    D --> E[Inertial propagation and uncertainty]
-    E --> F{Reliable GNSS fix?}
-    F -- Yes --> G[Gated GNSS correction]
-    F -- No --> H[Dead reckoning with conditional constraints]
-    G --> I[Raw navigation state]
+    D --> E[IMU propagation at every sample + uncertainty]
+    E --> I[Raw navigation state]
+    F[GNSS fix + age + accuracy + innovation] --> G{GNSS state machine}
+    G -- Reliable --> H[GNSS correction at nominal weight]
+    G -- Degraded --> J[GNSS correction with reduced weight]
+    G -- Stale or unusable --> K[Dead reckoning; IMU keeps running]
+    G -- Returning --> L[Gate fixes; ramp GNSS weight]
     H --> I
-    I --> J{Confident offline road candidate?}
-    J -- Yes --> K[Separate matched route state]
-    J -- No --> L[Use raw state only]
-    I --> M[Position, speed, heading, uncertainty, mode]
-    K --> M
-    L --> M
+    J --> I
+    K --> I
+    L --> I
+    I --> M{Confident offline road candidate?}
+    M -- Yes --> N[Separate matched route state]
+    M -- No --> O[Use raw state only]
+    I --> P[Position, speed, heading, uncertainty, mode]
+    N --> P
+    O --> P
 ```
+
+The IMU propagation loop never switches off when GNSS returns. GNSS updates are separate filter measurements. The phone and Python filters reject stale fixes, gate on reported accuracy and innovation, use a 1.5 s degraded-age threshold and 3 s dead-reckoning threshold, and promote returning GNSS through `GNSS_REACQUIRING`. Position corrections use 9x, 4x, then 1x nominal measurement variance over three accepted fixes. The mode is evaluated on the phone's 10 Hz output grid; this is a configured freshness policy, not a claim of detecting the physical tunnel entrance within milliseconds.
 
 **Offline model-development flow:** Audit and synchronize IO-VNBD phone/vehicle pairs → build phone-only input windows with vehicle speed as a training label → add train-only SUMO/CARLA scenarios and simulated device profiles → split real data by complete drive and phone model → train and compare candidates → replay the same held-out real GNSS outages → export and benchmark an ONNX candidate → connect it only if integrated position error improves. The simulation and ONNX stages are proposed; they are not completed in this repository.
 
@@ -92,15 +99,16 @@ The model-development path sits alongside this runtime path: real captures and s
 
 | Component | Responsibility | Repository location |
 |---|---|---|
-| Android acquisition and UI | Sensor discovery, timestamped capture, GNSS, export, and live state display | `android/app/src/main/java/org/sih/seamlessnav/MainActivity.kt` |
+| Android acquisition and UI | Sensor discovery, timestamped capture, GNSS, 10 Hz navigation logging, export, offline map and live state display | `android/app/src/main/java/org/sih/seamlessnav/MainActivity.kt` |
 | Phone signal processor | Initial calibration, motion events, and quality gates | `android/app/src/main/java/org/sih/seamlessnav/VehicleSignalProcessor.kt` |
 | Phone navigation engine | Kotlin 2D IMU/GNSS state estimation and 10 Hz output target | `android/app/src/main/java/org/sih/seamlessnav/PhoneNavigationEngine.kt` |
 | Reference fusion core | Python 2D filter for replay and algorithm work | `navcore/fusion.py` |
 | External-IMU boundary | Units, frame, clock, bias normalization and cadence diagnostics | `navcore/edge.py` |
 | Road matcher | Offline OSM graph and confidence-gated route hypotheses | `navcore/map_matching.py` |
+| Android vector map | Offline OSM road rendering, raw and matched path overlays, GNSS mode and match confidence | `android/app/src/main/java/org/sih/seamlessnav/OfflineRoadMapView.kt` |
 | Data and model pipeline | IO-VNBD auditing, labels, baseline training, outage replay, SUMO tooling | `scripts/` |
 
-The Kotlin phone path and Python edge reference currently implement related filter logic; they are **not one shared runtime binary**. The Python reference is planar, using forward acceleration and yaw rate rather than full 3D strapdown inertial navigation. External hardware-specific ingestion and Android map rendering are future integration work.
+The Kotlin phone path and Python edge reference currently implement related filter logic; they are **not one shared runtime binary**. The Python reference is planar, using forward acceleration and yaw rate rather than full 3D strapdown inertial navigation. The external adapter remains source-neutral; genuine sensor-specific ingestion and real 200 Hz target-hardware validation remain future work.
 
 ## 7. Tech stack
 
@@ -111,7 +119,7 @@ The Kotlin phone path and Python edge reference currently implement related filt
 | Navigation reference | Python 3.10+, NumPy | 2D fusion, external-IMU normalization, replay, and map matching |
 | Data analysis | pandas, Matplotlib | IO-VNBD preparation, metrics, and plots |
 | Data | IO-VNBD synchronized smartphone/vehicle logs | Phone IMU inputs and vehicle reference/labels; nominally 10 Hz |
-| Traffic simulation | SUMO FCD output | Existing scripts generate traffic scenarios and train-only synthetic IMU examples; SUMO runs and metrics are pending |
+| Traffic simulation | SUMO FCD output | Two controlled SUMO outage runs and a multi-FCD synthetic training comparison are complete; current synthetic and augmented candidates fail the real held-out gates |
 | Vehicle and sensor simulation, planned | CARLA | Proposed higher-fidelity IMU/GNSS and vehicle-dynamics scenarios; no CARLA integration exists yet |
 | Offline maps, optional | OpenStreetMap XML extract converted to local JSON | Regional road graph for offline matching; no extract is bundled |
 | Model baseline | Ridge regression implemented in project scripts | Offline speed experiment; not deployed in the app |
@@ -167,9 +175,9 @@ The artifact contract should record channel order, SI units, vehicle-frame conve
 
 ## 11. Evidence and next validation
 
-The synchronized IO-VNBD pipeline currently admits **64 of 72** phone/vehicle pairs after clock checks, yielding **726,618 phone samples**. The corrected held-out speed baseline reaches **5.94 m/s test MAE** but has **R² = -0.78** on the test drives. A 59.9 s simulated GNSS outage on S1 covers 348.2 m of reference travel; the current constrained inertial baseline ends **458.9 m** from the vehicle-GNSS reference (**131.8%** of distance). This does **not** meet the under-10% target. The reference is onboard vehicle GNSS, not surveyed truth.
+The synchronized IO-VNBD pipeline admits **64 of 72** phone/vehicle pairs after clock checks, yielding **726,618 phone samples** across 40 training, 20 validation and 4 held-out test drives. The current ridge speed-delta candidate test RMSE is **0.756 m/s**, slightly worse than the zero-change baseline at **0.752 m/s**. Across common 60 s outage intervals on all four test drives, IMU+NHC endpoint drift is **80.0%, 73.5%, 43.6% and 69.3%** of reference distance. The candidate's mean rises from **66.6% to 84.5%**, so it remains disconnected. None meets the under-10% target. These are replay results against onboard vehicle GNSS/odometry, not surveyed truth.
 
-The next proof points are a safely mounted moving phone capture with measured 10 Hz output and outage/reacquisition behavior, a genuine external high-rate IMU replay with cadence and latency measurements, multi-phone held-out testing, and repeated drive-held-out drift evaluations. SUMO and CARLA scenarios can improve training coverage after their parameters are calibrated to real captures. An ONNX candidate should enter navigation only after real outage improvement and target-device latency/parity checks. Model or map corrections should be introduced only with separate raw and corrected metrics.
+The next proof points are a safely mounted moving-phone capture that verifies 10 Hz output and outage/reacquisition behavior, a genuine external high-rate IMU replay, and an imported regional OSM pack for the demo route. Two fresh SUMO outage scenarios reached 200 Hz synthetic processing with sub-millisecond desktop latency, but raw drift remained **59.5% and 100.3%**; those synthetic timestamps are not a hardware benchmark. ONNX export and live model fusion remain deferred until a model beats real held-out speed and integrated outage baselines. Raw and map-aided paths must continue to report separate scores.
 
 ## Source notes
 

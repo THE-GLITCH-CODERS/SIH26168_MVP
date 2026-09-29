@@ -29,6 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from navcore.fusion import VehicleFusionFilter
 from navcore.speed_model import LinearSpeedDeltaModel
+from navcore.portable_speed import PortableSpeedModel
 
 DEFAULT_DIR = ROOT / "data/raw/iovnbd/extracted/Synchronised V abd S datasets/Categorised IOVNB Dataset/S (Driver A)/S1"
 G = 9.80665
@@ -116,18 +117,29 @@ def main() -> None:
         "--evaluate-speed-model", type=Path,
         help="offline candidate JSON to evaluate on this outage; never loads it into Android/live navigation",
     )
+    parser.add_argument("--evaluate-portable-speed", type=Path, help="Offline absolute-speed MLP what-if only; never promotes the artifact")
     args = parser.parse_args()
     if args.outage_start_s <= args.calibration_seconds or args.outage_seconds <= 0:
         raise SystemExit("Outage start must leave a complete, positive calibration window before it")
+    run_name = args.phone_csv.stem.removeprefix("S-") or "drive"
 
     phone = pd.read_csv(args.phone_csv, encoding="cp1252", low_memory=False)
     vehicle = pd.read_csv(args.vehicle_csv, encoding="cp1252", low_memory=False)
     phone.columns, vehicle.columns = phone.columns.str.strip(), vehicle.columns.str.strip()
 
-    phone_t = col(phone, "TIME SINCE START (ms)") / 1000.0
     phone_dates = pd.to_datetime(phone["DATE (YYYY-MO-DD HH-MI-SS_SSS)"], format="%Y-%m-%d %H:%M:%S:%f", errors="coerce")
-    if phone_dates.isna().any() or np.any(np.diff(phone_t) <= 0):
-        raise SystemExit("Phone timestamps are invalid or non-increasing")
+    if phone_dates.isna().any():
+        raise SystemExit("Phone wall-clock timestamps contain invalid rows")
+    # The phone's session timer can reset when its logger restarts inside a
+    # long drive file (observed in IO-VNBD S2). Use the recorded wall-clock
+    # timestamps as the continuous replay axis, and retain the session timer
+    # only as a diagnostic. This also keeps model windows from running
+    # backwards across a logger restart.
+    phone_timer_s = col(phone, "TIME SINCE START (ms)") / 1000.0
+    phone_t = (phone_dates - phone_dates.iloc[0]).dt.total_seconds().to_numpy(dtype=np.float64)
+    phone_timer_reset_count = int(np.count_nonzero(np.diff(phone_timer_s) <= 0.0))
+    if np.any(~np.isfinite(phone_t)) or np.any(np.diff(phone_t) <= 0):
+        raise SystemExit("Phone wall-clock timestamps are invalid or non-increasing")
     phone_tod = (phone_dates.dt.hour * 3600 + phone_dates.dt.minute * 60 + phone_dates.dt.second + phone_dates.dt.microsecond / 1e6).to_numpy(dtype=float)
     vehicle_tod = col(vehicle, "Time Since Start of Day (seconds)")
     vehicle_tod_unwrapped = vehicle_tod.copy()
@@ -154,7 +166,10 @@ def main() -> None:
     gyro = phone[gyro_cols].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
     linear_accel = accel - gravity
     speed_model = LinearSpeedDeltaModel.from_json(args.evaluate_speed_model) if args.evaluate_speed_model else None
-    model_features = np.column_stack((accel, gravity, linear_accel, gyro)).astype(np.float32) if speed_model else None
+    portable_model = PortableSpeedModel.load(args.evaluate_portable_speed) if args.evaluate_portable_speed else None
+    model_features = np.column_stack((accel, gravity, linear_accel, gyro)).astype(np.float32) if (speed_model or portable_model) else None
+    if portable_model and abs(1.0 / np.median(np.diff(phone_t)) - 10.0) > 0.5:
+        raise SystemExit("Portable model requires nominal 10 Hz input")
     if speed_model is not None:
         measured_feature_rate = float(1.0 / np.median(np.diff(phone_t)))
         if abs(measured_feature_rate - speed_model.feature_rate_hz) / speed_model.feature_rate_hz > 0.05:
@@ -205,6 +220,11 @@ def main() -> None:
     }
     if speed_model is not None:
         filters["imu_nhc_speed_model"] = VehicleFusionFilter(output_hz=10.0, initial_east_m=0.0, initial_north_m=0.0, initial_speed_mps=initial_speed, initial_heading_rad=initial_heading, initial_position_sigma_m=1.0, initial_velocity_sigma_mps=0.5)
+    if portable_model is not None:
+        filters["imu_nhc_portable_speed"] = VehicleFusionFilter(output_hz=10.0, initial_speed_mps=initial_speed, initial_heading_rad=initial_heading, initial_position_sigma_m=1.0, initial_velocity_sigma_mps=0.5)
+    next_portable_s = -math.inf
+    portable_predictions = 0
+    portable_ood = 0
     tracks: dict[str, list] = {name: [] for name in filters}
     inference_ms: dict[str, list[float]] = {name: [] for name in filters}
     base_e, base_n = 0.0, 0.0
@@ -236,12 +256,23 @@ def main() -> None:
                     virtual_speed, virtual_variance = predicted_speed, prediction_variance
                     pending_speed_update = None
                     virtual_speed_updates += 1
+            if name == "imu_nhc_portable_speed" and phone_t[i] >= next_portable_s and quality >= 0.7 and i >= 19:
+                intervals = np.diff(phone_t[i-19:i+1])
+                if np.all(intervals > 0) and np.max(intervals) <= 0.15 and np.isfinite(model_features[i-19:i+1]).all():
+                    prediction = portable_model.predict(model_features[i-19:i+1])
+                    portable_predictions += 1
+                    if prediction["out_of_domain"]:
+                        portable_ood += 1
+                    else:
+                        virtual_speed = prediction["speed_mps"]
+                        virtual_variance = 4.0 * prediction["variance_m2ps2"]
+                    next_portable_s = phone_t[i] + 1.0
             output = estimator.process_imu(
                 timestamp_ns,
                 forward_accel_mps2=(0.0 if name == "gyro_only_constant_speed" else forward_accel),
                 yaw_rate_radps=phone_yaw_rate,
                 quality=quality,
-                normal_driving=(name in {"imu_nhc", "gyro_only_constant_speed", "imu_nhc_speed_model"}),
+                normal_driving=(name in {"imu_nhc", "gyro_only_constant_speed", "imu_nhc_speed_model", "imu_nhc_portable_speed"}),
                 virtual_speed_mps=virtual_speed,
                 virtual_speed_variance=virtual_variance,
             )
@@ -301,11 +332,13 @@ def main() -> None:
             result.imu_nhc_speed_model_east_m.to_numpy(), result.imu_nhc_speed_model_north_m.to_numpy(),
             ref_e, ref_n, distance, duration,
         )
+    if portable_model is not None:
+        metric_sets["imu_nhc_portable_speed"] = trajectory_metrics(result.imu_nhc_portable_speed_east_m.to_numpy(), result.imu_nhc_portable_speed_north_m.to_numpy(), ref_e, ref_n, distance, duration)
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = output_dir / "S1_outage_trajectory.csv"
-    plot_path = output_dir / "S1_outage_trajectory.png"
-    summary_path = output_dir / "S1_outage_metrics.json"
+    csv_path = output_dir / f"{run_name}_outage_trajectory.csv"
+    plot_path = output_dir / f"{run_name}_outage_trajectory.png"
+    summary_path = output_dir / f"{run_name}_outage_metrics.json"
     result.to_csv(csv_path, index=False)
 
     fig, axes = plt.subplots(1, 2, figsize=(13, 6), constrained_layout=True)
@@ -316,8 +349,10 @@ def main() -> None:
     axes[0].plot(result.gyro_only_constant_speed_east_m, result.gyro_only_constant_speed_north_m, label="Gyro + constant speed + NHC")
     if speed_model is not None:
         axes[0].plot(result.imu_nhc_speed_model_east_m, result.imu_nhc_speed_model_north_m, label="Phone IMU + NHC + candidate speed")
+    if portable_model is not None:
+        axes[0].plot(result.imu_nhc_portable_speed_east_m, result.imu_nhc_portable_speed_north_m, label="IMU + NHC + absolute-speed MLP")
     axes[0].scatter([0], [0], marker="o", s=40, color="green", label="Outage start")
-    axes[0].set_title("Synthetic GNSS outage trajectory")
+    axes[0].set_title(f"Synthetic GNSS outage trajectory · {run_name}")
     axes[0].set_xlabel("East from outage start (m)")
     axes[0].set_ylabel("North from outage start (m)")
     axes[0].axis("equal")
@@ -327,6 +362,8 @@ def main() -> None:
     plot_methods = [("constant_speed", "Straight constant speed"), ("imu_no_nhc", "Phone IMU, no NHC"), ("imu_nhc", "Phone IMU + NHC"), ("gyro_only_constant_speed", "Gyro + constant speed + NHC")]
     if speed_model is not None:
         plot_methods.append(("imu_nhc_speed_model", "Phone IMU + NHC + candidate speed"))
+    if portable_model is not None:
+        plot_methods.append(("imu_nhc_portable_speed", "IMU + NHC + absolute-speed MLP"))
     for name, title in plot_methods:
         e_col, n_col = f"{name}_east_m", f"{name}_north_m"
         error = np.hypot(result[e_col].to_numpy() - ref_e, result[n_col].to_numpy() - ref_n)
@@ -340,13 +377,15 @@ def main() -> None:
     plt.close(fig)
 
     summary = {
-        "dataset": "IO-VNBD synchronized categorized S1",
+        "dataset": f"IO-VNBD synchronized categorized {run_name}",
         "phone_csv": str(args.phone_csv.resolve()),
         "vehicle_csv_reference_and_pre_outage_calibration": str(args.vehicle_csv.resolve()),
         "outage_start_s_from_phone_log": outage_start,
         "outage_duration_s": duration,
         "outage_samples": int(len(result)),
         "phone_sample_rate_hz_median": float(1.0 / np.median(np.diff(phone_t[outage_mask]))),
+        "phone_elapsed_time_source": "monotonic wall-clock timestamps; session timer retained for diagnostics because it may reset",
+        "phone_session_timer_reset_count": phone_timer_reset_count,
         "filter_output_rate_hz": 10.0,
         "phone_vehicle_clock_offset_s": clock_offset,
         "phone_vehicle_clock_residual_p95_s": clock_p95,
@@ -378,6 +417,12 @@ def main() -> None:
             "artifact_eligible_for_fusion": speed_model.eligible_for_fusion,
             "note": "Explicit offline what-if evaluation only. This replay does not authorize deployment; compare untouched held-out real outage windows and keep raw tracks separate.",
         },
+        "portable_speed_what_if": None if portable_model is None else {
+            "model": str(args.evaluate_portable_speed), "predictions": portable_predictions,
+            "out_of_domain_rejections": portable_ood, "variance_multiplier": 4.0,
+            "artifact_eligible_for_fusion": portable_model.doc.get("eligible_for_fusion", False),
+            "note": "Offline experiment overrides promotion flag only here; no deployment authorization"
+        },
         "desktop_filter_call_latency_ms": {
             name: {
                 "p50": float(np.percentile(samples, 50)),
@@ -388,10 +433,10 @@ def main() -> None:
             for name, samples in inference_ms.items()
         },
         "limitations": [
-            "Synthetic outage is a replay experiment, not a real GNSS-denied collection.",
+            "GNSS outage is simulated in replay, not a real GNSS-denied collection.",
             "Vehicle GNSS/odometry is an onboard reference, not surveyed ground truth.",
             "Vehicle labels are used before outage to calibrate phone-to-vehicle sensor axes and initialize position, speed and heading; they are not inputs during the outage.",
-            "This initial method is a calibrated physics baseline; it does not yet use a learned speed model, map matching, adaptive event classifier, or Android live sensor stream.",
+            "The speed model, when supplied, is evaluated offline as a separate what-if candidate. Map matching is not used to score the raw trajectory.",
             "The selected IO-VNBD smartphone stream is nominally 10 Hz and cannot establish 200 Hz edge performance.",
         ],
         "artifacts": {"trajectory_csv": str(csv_path), "trajectory_plot": str(plot_path)},

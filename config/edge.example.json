@@ -1,0 +1,12 @@
+{
+  "output_hz": 200,
+  "imu": {
+    "acceleration_unit": "m/s2",
+    "angular_rate_unit": "rad/s",
+    "timestamp_unit": "ns",
+    "target_imu_hz": 200,
+    "sensor_to_vehicle_rotation": [1, 0, 0, 0, 1, 0, 0, 0, 1],
+    "acceleration_is_gravity_compensated": false,
+    "gravity_specific_force_sensor_mps2": [0, 0, 9.80665]
+  }
+}

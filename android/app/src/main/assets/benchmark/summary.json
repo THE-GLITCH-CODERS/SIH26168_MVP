@@ -1,0 +1,54 @@
+[
+  {
+    "drive": "S1",
+    "baseline_drift_percent": 79.98383243073927,
+    "portable_drift_percent": 79.44987344975057,
+    "predictions": {
+      "model": "outputs\\portable_speed_v1\\model.json",
+      "predictions": 55,
+      "out_of_domain_rejections": 0,
+      "variance_multiplier": 4.0,
+      "artifact_eligible_for_fusion": false,
+      "note": "Offline experiment overrides promotion flag only here; no deployment authorization"
+    }
+  },
+  {
+    "drive": "S2",
+    "baseline_drift_percent": 73.50914359021108,
+    "portable_drift_percent": 67.215917795758,
+    "predictions": {
+      "model": "outputs\\portable_speed_v1\\model.json",
+      "predictions": 59,
+      "out_of_domain_rejections": 2,
+      "variance_multiplier": 4.0,
+      "artifact_eligible_for_fusion": false,
+      "note": "Offline experiment overrides promotion flag only here; no deployment authorization"
+    }
+  },
+  {
+    "drive": "S3a",
+    "baseline_drift_percent": 43.55667796688508,
+    "portable_drift_percent": 61.972624810072794,
+    "predictions": {
+      "model": "outputs\\portable_speed_v1\\model.json",
+      "predictions": 58,
+      "out_of_domain_rejections": 0,
+      "variance_multiplier": 4.0,
+      "artifact_eligible_for_fusion": false,
+      "note": "Offline experiment overrides promotion flag only here; no deployment authorization"
+    }
+  },
+  {
+    "drive": "S3c",
+    "baseline_drift_percent": 69.25594142225835,
+    "portable_drift_percent": 37.74281842601824,
+    "predictions": {
+      "model": "outputs\\portable_speed_v1\\model.json",
+      "predictions": 52,
+      "out_of_domain_rejections": 0,
+      "variance_multiplier": 4.0,
+      "artifact_eligible_for_fusion": false,
+      "note": "Offline experiment overrides promotion flag only here; no deployment authorization"
+    }
+  }
+]

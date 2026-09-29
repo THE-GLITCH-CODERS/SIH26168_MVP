@@ -22,7 +22,7 @@ The test MAE improves over this weak constant baseline, but negative R² and lar
 
 A separate 59.9 s S1 synthetic outage traversed 348.2 m according to the onboard vehicle GNSS reference. The physics NHC filter ended 458.9 m from the reference (131.8% of distance); the constant-speed baseline ended 508.2 m away (146.0%). Both fail the stated <10% endpoint criterion. The reference is vehicle GNSS, not surveyed truth.
 
-A speed correction can enter fusion only after it improves both drive-held-out validation/test and integrated outage position metrics on untouched windows. It must also report uncertainty and be gated off during shocks, turns with poor alignment, mount shifts, and unfamiliar device profiles. The old speed-delta v1 artifacts were trained on the time-compressed data and are invalid; do not use them.
+A speed correction can enter fusion only after it improves both drive-held-out validation/test and integrated outage position metrics on untouched windows. It must also report uncertainty and be gated off during shocks, turns with poor alignment, mount shifts, and unfamiliar device profiles. The artifacts under the original `outputs/speed_delta_v1/` and `outputs/speed_delta_v1_h05/` were trained on the time-compressed data and are invalid; do not use those files.
 
 ## Next model work
 
@@ -30,3 +30,9 @@ A speed correction can enter fusion only after it improves both drive-held-out v
 2. Examine test errors by drive, speed bin, stop/turn/shock event and phone/device profile. Preserve complete drives when splitting.
 3. Retrain a causal forward-speed-change or acceleration model and calibrate its uncertainty on validation drives.
 4. Replay the same held-out GNSS outage intervals with and without the candidate. Keep it disabled unless integrated endpoint, max-error, and RMSE metrics improve without hiding GNSS reacquisition errors.
+
+## Fresh full-split replay (2026-09-29)
+
+The corrected dataset was retrained to `outputs/speed_delta_v2/` on all eligible windows from 40 train, 20 validation, and 4 test drives. Its 1 s speed-change test RMSE is **0.756 m/s**, slightly worse than the zero-change baseline at **0.752 m/s**. The model does not pass the baseline comparison.
+
+The corrected replay uses continuous wall-clock timestamps because the S2 session timer resets once. Four equal test-drive outages use 30 s pre-outage calibration, then 60 s without GNSS. IMU+NHC mean endpoint drift is **66.6%** of reference distance; the real-only speed candidate is **84.5%** and improves only 2/4 drives. The real-plus-SUMO model has test speed RMSE **0.772 m/s** and averages **93.8%** outage drift, improving only 1/4 drives. Neither candidate is eligible for fusion. Detailed reports are under `outputs/sumo_architecture_v1/outage_models/`, with the aggregate at `outputs/sumo_architecture_v1/heldout_model_outage_comparison.json`.
